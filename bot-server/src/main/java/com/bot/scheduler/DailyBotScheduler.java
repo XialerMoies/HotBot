@@ -47,7 +47,7 @@ public class DailyBotScheduler {
                              HistoryTodayService historyTodayService, TemplateRenderer renderer, WeChatPusher pusher,
                              PythonMLClient mlClient) {
         this(weatherService, newsService, wordService, jokeService, trackingService, commentSourceService,
-                historyTodayService, renderer, pusher, mlClient, new EventClusteringService());
+                historyTodayService, renderer, pusher, mlClient, null);
     }
 
     /** Last push signature — used for dedup. */
@@ -187,6 +187,7 @@ public class DailyBotScheduler {
     }
 
     private void clusterNews(List<NewsItem> news) {
+        if (eventClusteringService == null) return; // Compatibility callers do not own a persistent event store.
         for (NewsItem item : news) {
             try {
                 eventClusteringService.clusterNews(item);

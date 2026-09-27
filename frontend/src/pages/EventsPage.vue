@@ -18,7 +18,7 @@ const router = useRouter();
 const query = ref("");
 const status = ref("");
 const page = ref(1);
-const detail = useResource(api.eventDetail, null);
+const detail = useResource(async id => ({articles: await api.evidenceSources(id)}), null);
 
 function subjectsOf(event) {
   return event.subjects?.length ? event.subjects : (event.entities || []).slice(0, 1).map((name) => ({ name, type: "UNKNOWN", role: "PRIMARY" }));

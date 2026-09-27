@@ -17,6 +17,7 @@ from services.translation import ensure_translation_backend_async
 from services.translation import translation_backend_status
 from storage.chroma_client import add_news, query_similar, add_entity, query_entity_history
 from services.evidence import EvidenceItem, build_evidence_answer
+from services.article_content import fetch_article
 
 app = FastAPI(title="Hotspot Bot ML Server", version="1.0.0")
 
@@ -101,6 +102,13 @@ class EvidenceRequest(BaseModel):
     question: str
     evidence: list[dict] = Field(default_factory=list)
 
+class ArticleContentRequest(BaseModel):
+    url: str = Field(max_length=2048)
+
+@app.post("/api/articles/content")
+def article_content(req: ArticleContentRequest):
+    return fetch_article(req.url)
+
 
 # ---- Endpoints ----
 
@@ -140,7 +148,7 @@ def api_evidence_answer(req: EvidenceRequest):
         id=str(item.get("id", f"ev-{index + 1}")),
         article_id=str(item.get("article_id", item.get("articleId", ""))),
         quote=str(item.get("quote", "")),
-        title=str(item.get("title", "")),
+        title=str(item.get("title", "")) + (" [仅摘要]" if item.get("kind") in {"SUMMARY", "EXCERPT"} else ""),
         url=str(item.get("url", "")),
         published_at=str(item.get("published_at", item.get("publishedAt", ""))),
     ) for index, item in enumerate(req.evidence) if item.get("quote")]

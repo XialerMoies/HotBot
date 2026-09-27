@@ -29,6 +29,7 @@ import java.util.stream.Collectors;
  * Persistence can be added behind this service without changing the scoring contract.
  */
 @Service
+@lombok.extern.slf4j.Slf4j
 public class EventClusteringService {
     static final double AUTO_ASSIGN_THRESHOLD = 0.72;
     static final double CANDIDATE_THRESHOLD = 0.58;
@@ -38,18 +39,41 @@ public class EventClusteringService {
     private final Map<String, NewsItem> articles = new LinkedHashMap<>();
     private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
     private final Path stateFile;
+    private final boolean enforceContentPolicy;
+    private final NewsContentPolicy contentPolicy = new NewsContentPolicy();
+    private final EventEntityResolver entityResolver = new EventEntityResolver();
 
     public EventClusteringService() {
-        this(Path.of(System.getProperty("hotbot.event.state", "storage/events.json")));
+        this(Path.of(System.getProperty("hotbot.event.state", "storage/events.json")), true);
     }
 
     EventClusteringService(Path stateFile) {
+        this(stateFile, false); // Package-private algorithm fixtures use isolated temporary state.
+    }
+
+    EventClusteringService(Path stateFile, boolean enforceContentPolicy) {
         this.stateFile = stateFile;
+        this.enforceContentPolicy = enforceContentPolicy;
+        if (enforceContentPolicy) {
+            try {
+                var report = new EventDataMaintenance().clean(stateFile, true);
+                log.info("Event scope maintenance: {}", report);
+            } catch (java.io.IOException exception) {
+                throw new IllegalStateException("Event maintenance failed; original state preserved", exception);
+            }
+        }
         restore();
+        if (enforceContentPolicy) refreshStoredFeatures();
     }
 
     public synchronized EventClusterResponse cluster(EventClusterRequest request) {
         validate(request);
+        if (enforceContentPolicy) {
+            NewsItem article = articles.get(request.articleId());
+            if (article == null || !request.title().equals(article.getTitle()))
+                throw new IllegalArgumentException("Source article required; use /api/events/cluster/news with source and URL");
+            contentPolicy.requireAccepted(article);
+        }
         ClusterState existing = clusters.values().stream()
                 .filter(cluster -> cluster.event().articleIds().contains(request.articleId()))
                 .findFirst().orElse(null);
@@ -75,20 +99,37 @@ public class EventClusteringService {
     }
 
     public synchronized EventClusterResponse clusterNews(com.bot.model.NewsItem item) {
-        if (item != null && item.getId() != null) articles.put(item.getId(), item);
-        String text = (item.getTitle() == null ? "" : item.getTitle()) + "\n" + item.summaryPreviewText();
-        return cluster(new EventClusterRequest(item.getId(), item.getTitle(), text, parseTime(item.getPublishTime()),
-                item.getEntities(), item.getKeywords() == null || item.getKeywords().isEmpty() ? item.getTags() : item.getKeywords(), item.getEmbedding() == null ? new double[0] : item.getEmbedding().stream().mapToDouble(Float::doubleValue).toArray(), item.getEntityMentions()));
+        if (item == null || item.getId() == null || item.getId().isBlank() || item.getTitle() == null || item.getTitle().isBlank())
+            throw new IllegalArgumentException("Article id and title are required");
+        if (enforceContentPolicy) contentPolicy.requireAccepted(item);
+        item = objectMapper.convertValue(item, NewsItem.class); // Caller mutations cannot corrupt stored identity/features.
+        entityResolver.enrich(item);
+        final NewsItem incoming = item;
+        NewsItem existingArticle = articles.values().stream().filter(a ->
+                a.getId().equals(incoming.getId()) || (incoming.getUrl() != null && incoming.getUrl().equals(a.getUrl())
+                && java.util.Objects.equals(incoming.getSource(), a.getSource())))
+                .filter(a -> clusters.values().stream().anyMatch(c -> c.event().articleIds().contains(a.getId())))
+                .findFirst().orElse(null);
+        if (existingArticle != null) return cluster(requestFor(existingArticle));
+        articles.putIfAbsent(item.getId(), item);
+        return cluster(requestFor(item));
+    }
+
+    private static EventClusterRequest requestFor(NewsItem item) {
+        return new EventClusterRequest(item.getId(), item.getTitle(), EventEntityResolver.text(item), parseTime(item.getPublishTime()),
+                item.getEntities(), item.getKeywords(), item.getEmbedding() == null ? new double[0]
+                : item.getEmbedding().stream().mapToDouble(Float::doubleValue).toArray(), item.getEntityMentions());
     }
 
     public synchronized void registerArticles(List<NewsItem> items) {
         if (items == null) return;
-        items.stream().filter(item -> item != null && item.getId() != null).forEach(item -> articles.put(item.getId(), item));
+        items.stream().filter(item -> item != null && item.getId() != null)
+                .filter(item -> !enforceContentPolicy || contentPolicy.evaluate(item).accepted())
+                .forEach(item -> articles.putIfAbsent(item.getId(), item));
     }
 
     private static Instant parseTime(String value) {
-        try { return value == null || value.isBlank() ? Instant.now() : Instant.parse(value); }
-        catch (Exception ignored) { return Instant.now(); }
+        return com.bot.util.NewsTimeUtils.parseInstant(value);
     }
 
     public synchronized List<TechEvent> list() {
@@ -110,6 +151,14 @@ public class EventClusteringService {
         return state.event().articleIds().stream().map(articles::get).filter(java.util.Objects::nonNull).toList();
     }
 
+    public synchronized void saveArticleContent(String id, String body, String status, String fetchedAt) {
+        NewsItem article=articles.get(id);
+        if(article==null) throw new IllegalArgumentException("article not found");
+        if(body!=null && !body.isBlank()) article.setFullBody(body);
+        article.setContentStatus(status); article.setContentFetchedAt(fetchedAt);
+        persist();
+    }
+
     private TechEvent create(EventClusterRequest request) {
         String id = "event-" + UUID.randomUUID();
         ClusterState state = ClusterState.initial(id, request);
@@ -119,6 +168,20 @@ public class EventClusteringService {
     }
 
     private Match score(EventClusterRequest request, ClusterState cluster) {
+        if (articles.containsKey(request.articleId())) {
+            // Match against original reports, never a centroid that drifts between unrelated incidents.
+            // The first report bounds cluster lifetime so daily updates cannot chain forever.
+            if (request.publishedAt() == null || cluster.event().firstSeenAt() == null
+                    || Math.abs(Duration.between(request.publishedAt(), cluster.event().firstSeenAt()).toSeconds()) >= TIME_WINDOW.toSeconds())
+                return new Match(cluster, 0, List.of("outside-time-window"));
+            return cluster.event().articleIds().stream().map(articles::get).filter(java.util.Objects::nonNull)
+                    .map(article -> EventMatchPolicy.compare(request, requestFor(article)))
+                    .map(result -> new Match(cluster, result.score(), result.signals()))
+                    .max(java.util.Comparator.comparingDouble(Match::score))
+                    .orElse(new Match(cluster, 0, List.of("missing-article")));
+        }
+        if (request.publishedAt() == null || timeScore(request.publishedAt(), cluster.event().firstSeenAt()) == 0)
+            return new Match(cluster, 0, List.of("outside-time-window"));
         double semantic = cosine(request.embedding(), cluster.embedding());
         double entity = overlap(request.entities(), cluster.entities());
         double keyword = overlap(request.keywords(), cluster.keywords());
@@ -173,10 +236,15 @@ public class EventClusteringService {
         try {
             Path parent = stateFile.getParent();
             if (parent != null) Files.createDirectories(parent);
-            objectMapper.writeValue(stateFile.toFile(), clusters.values().stream()
-                    .map(state -> PersistedCluster.from(state, articles)).toList());
-        } catch (Exception ignored) {
-            // Persistence failure must not break ingestion; the task log can report it later.
+            Path staged = Files.createTempFile(stateFile.toAbsolutePath().getParent(), "events-save-", ".tmp");
+            try {
+                objectMapper.writeValue(staged.toFile(), clusters.values().stream()
+                        .map(state -> PersistedCluster.from(state, articles)).toList());
+                Files.move(staged, stateFile.toAbsolutePath(), java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            } finally { Files.deleteIfExists(staged); }
+        } catch (Exception exception) {
+            throw new IllegalStateException("Failed to persist event state", exception);
         }
     }
 
@@ -192,8 +260,8 @@ public class EventClusteringService {
                         value.keywords == null ? Set.of() : new LinkedHashSet<>(value.keywords)));
                 if (value.articles != null) value.articles.forEach(article -> articles.put(article.getId(), article));
             }
-        } catch (Exception ignored) {
-            // Ignore malformed stale state and start clean; new events will overwrite it.
+        } catch (Exception exception) {
+            throw new IllegalStateException("Failed to restore event state; refusing to overwrite", exception);
         }
     }
 
@@ -205,6 +273,57 @@ public class EventClusteringService {
                 .toList();
         return new TechEvent(event.id(), event.name(), event.status(), event.firstSeenAt(), event.lastUpdatedAt(),
                 event.entities(), subjects, event.articleIds(), event.confidence(), event.timeline());
+    }
+
+    /** Backfill only evidence-supported subjects/timestamps; keep public event IDs and grouping stable. */
+    private void refreshStoredFeatures() {
+        if (clusters.isEmpty()) return;
+        try {
+            String before = objectMapper.writeValueAsString(clusters.values().stream().map(s -> PersistedCluster.from(s, articles)).toList());
+            articles.values().forEach(entityResolver::enrich);
+            for (var entry : new ArrayList<>(clusters.entrySet())) {
+                ClusterState old = entry.getValue();
+                List<EntityMention> mentions = new ArrayList<>();
+                LinkedHashSet<String> entities = new LinkedHashSet<>(), keywords = new LinkedHashSet<>();
+                List<TechEvent.TimelineNode> timeline = new ArrayList<>();
+                for (String id : old.event().articleIds()) {
+                    NewsItem article = articles.get(id);
+                    if (article == null) continue;
+                    mentions.addAll(article.getEntityMentions()); entities.addAll(article.getEntities()); keywords.addAll(article.getKeywords());
+                    Instant published = parseTime(article.getPublishTime());
+                    if (published == null) published = old.event().timeline().stream().filter(n -> n.articleId().equals(id))
+                            .map(TechEvent.TimelineNode::occurredAt).filter(java.util.Objects::nonNull).findFirst().orElse(old.event().firstSeenAt());
+                    timeline.add(new TechEvent.TimelineNode(id, published, "UPDATE", article.getTitle()));
+                }
+                if (timeline.isEmpty()) continue;
+                timeline = chronological(timeline);
+                var event = old.event();
+                var request = new EventClusterRequest("backfill", event.name(), event.name(), timeline.get(0).occurredAt(),
+                        new ArrayList<>(entities), new ArrayList<>(keywords), old.embedding(), mentions);
+                var updated = new TechEvent(event.id(), event.name(), event.status(), timeline.get(0).occurredAt(), timeline.get(timeline.size()-1).occurredAt(),
+                        new ArrayList<>(entities), inferSubjects(request), event.articleIds(), event.confidence(), timeline);
+                clusters.put(entry.getKey(), new ClusterState(updated, old.embedding(), ClusterState.normalizeSet(new ArrayList<>(entities)), keywords));
+            }
+            String after = objectMapper.writeValueAsString(clusters.values().stream().map(s -> PersistedCluster.from(s, articles)).toList());
+            if (!before.equals(after)) {
+                Path backup = stateFile.toAbsolutePath().getParent().resolve("quarantine").resolve("features-" + Instant.now().toEpochMilli());
+                Files.createDirectories(backup);
+                Files.copy(stateFile, backup.resolve("events.backup.json"));
+                persist();
+                log.info("Backfilled subjects and publication times for {} events; backup={}", clusters.size(), backup);
+            }
+        } catch (Exception exception) { throw new IllegalStateException("Feature backfill failed; original backup preserved", exception); }
+    }
+
+    private static List<TechEvent.TimelineNode> chronological(List<TechEvent.TimelineNode> nodes) {
+        List<TechEvent.TimelineNode> sorted = nodes.stream().sorted(java.util.Comparator.comparing(TechEvent.TimelineNode::occurredAt,
+                java.util.Comparator.nullsLast(java.util.Comparator.naturalOrder())).thenComparing(TechEvent.TimelineNode::articleId)).toList();
+        List<TechEvent.TimelineNode> result = new ArrayList<>();
+        for (int i=0;i<sorted.size();i++) {
+            var n=sorted.get(i);
+            result.add(new TechEvent.TimelineNode(n.articleId(), n.occurredAt(), i==0 ? "FIRST_REPORT" : "UPDATE", n.summary()));
+        }
+        return result;
     }
 
     private record Match(ClusterState cluster, double score, List<String> signals) {}
@@ -249,7 +368,7 @@ public class EventClusteringService {
             List<TechEvent.TimelineNode> timeline = new ArrayList<>(event.timeline());
             if (timeline.stream().noneMatch(node -> node.articleId().equals(request.articleId()))) {
                 timeline.add(new TechEvent.TimelineNode(request.articleId(), published, "UPDATE", request.title()));
-                timeline.sort(java.util.Comparator.comparing(TechEvent.TimelineNode::occurredAt));
+                timeline = chronological(timeline);
             }
             List<EventSubject> mergedSubjects = mergeSubjects(event.subjects(), inferSubjects(request));
             TechEvent updated = new TechEvent(event.id(), event.name(), "ONGOING", first, latest,
@@ -261,8 +380,12 @@ public class EventClusteringService {
         private static List<EventSubject> mergeSubjects(List<EventSubject> existing, List<EventSubject> incoming) {
             Map<String, EventSubject> merged = new LinkedHashMap<>();
             existing.forEach(subject -> merged.put(normalize(subject.name()), subject));
-            incoming.forEach(subject -> merged.putIfAbsent(normalize(subject.name()), subject));
-            return new ArrayList<>(merged.values());
+            incoming.forEach(subject -> merged.merge(normalize(subject.name()), subject,
+                    (old, next) -> old.type().equals("UNKNOWN") ? next : old));
+            List<EventSubject> result = new ArrayList<>();
+            merged.values().forEach(subject -> result.add(new EventSubject(subject.name(), subject.type(),
+                    result.isEmpty() ? "PRIMARY" : "RELATED", subject.confidence())));
+            return result;
         }
 
         private static Set<String> normalizeSet(List<String> values) {
@@ -277,7 +400,10 @@ public class EventClusteringService {
         Set<String> seen = new LinkedHashSet<>();
         mentions.stream()
                 .filter(value -> value != null && value.name() != null && !value.name().isBlank())
-                .sorted((left, right) -> Integer.compare(subjectPriority(right.type()), subjectPriority(left.type())))
+                .sorted(java.util.Comparator.<EntityMention>comparingInt(value ->
+                        new EventEntityResolver().resolve(request.title(), List.of(value)).stream()
+                                .anyMatch(found -> found.name().equalsIgnoreCase(value.name())) ? 1 : 0).reversed()
+                        .thenComparing(java.util.Comparator.comparingInt((EntityMention value) -> subjectPriority(value.type())).reversed()))
                 .forEach(value -> {
                     String key = normalize(value.name());
                     if (seen.add(key)) {
@@ -295,7 +421,7 @@ public class EventClusteringService {
 
     private static int subjectPriority(String type) {
         return switch (type == null ? "" : type.toUpperCase(Locale.ROOT)) {
-            case "ORG", "COMPANY" -> 5;
+            case "ORG", "ORGANIZATION", "COMPANY" -> 5;
             case "PERSON" -> 4;
             case "PRODUCT" -> 3;
             case "TECHNOLOGY", "TECH" -> 2;
@@ -305,7 +431,8 @@ public class EventClusteringService {
 
     private static String subjectType(String type) {
         return switch (type == null ? "" : type.toUpperCase(Locale.ROOT)) {
-            case "ORG" -> "COMPANY";
+            case "COMPANY" -> "COMPANY";
+            case "ORG", "ORGANIZATION" -> "ORGANIZATION";
             case "PERSON" -> "PERSON";
             case "PRODUCT" -> "PRODUCT";
             case "TECHNOLOGY", "TECH" -> "TECHNOLOGY";

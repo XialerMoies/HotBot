@@ -23,8 +23,10 @@ const messages = {
 };
 export const api = {
   listEvents: () => client.get("/events").then(data),
+  evidenceStatus: () => client.get('/evidence/status', {timeout:12000}).then(data),
   listArticles: () => client.get("/events/articles").then(data),
   eventDetail: (value) => client.get("/events/" + id(value)).then(data),
+  evidenceSources: (value) => client.get('/evidence/events/' + id(value) + '/sources', {timeout:40000}).then(data),
   sources: () => client.get("/operations/sources").then(data),
   workspace: () =>
     token()

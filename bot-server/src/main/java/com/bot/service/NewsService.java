@@ -121,6 +121,8 @@ public class NewsService {
         }
 
         List<FeedTask> feedTasks = feeds.stream()
+                .filter(AppConfig.BotConfig.NewsConfig.FeedConfig::isEnabled)
+                .filter(feed -> !botConfig.getNews().isTechOnly() || CATEGORY_TECH.equalsIgnoreCase(feed.getCategory()))
                 .map(feed -> new FeedTask(feed.getName(), al -> dispatchFeed(feed, al)))
                 .toList();
 
@@ -128,16 +130,31 @@ public class NewsService {
                 .map(this::startFeedFetch)
                 .toList();
 
-        for (CompletableFuture<FeedBatch> future : futures) {
-            FeedBatch batch = future.join();
+        for (int index = 0; index < futures.size(); index++) {
+            FeedBatch batch = futures.get(index).join();
+            if (dataSourceStatusService != null) {
+                String source = feedTasks.get(index).source();
+                if (batch.items().isEmpty() && !batch.alerts().isEmpty())
+                    dataSourceStatusService.failed(source, batch.alerts().get(batch.alerts().size() - 1).message());
+                else dataSourceStatusService.succeeded(source);
+            }
             all.addAll(batch.items());
             alerts.addAll(batch.alerts());
         }
 
+        if (botConfig.getNews().isTechOnly()) {
+            NewsContentPolicy policy = new NewsContentPolicy();
+            Map<String, Integer> rejected = new TreeMap<>();
+            all = all.stream().filter(item -> {
+                var decision = policy.evaluate(item);
+                if (!decision.accepted()) rejected.merge(decision.reason(), 1, Integer::sum);
+                return decision.accepted();
+            }).toList();
+            log.info("News scope {}: accepted={}, rejected={}", NewsContentPolicy.VERSION, all.size(), rejected);
+        }
         List<NewsItem> unique = deduplicate(all);
         enrichEventFeatures(unique, alerts);
         if (eventClusteringService != null) {
-            eventClusteringService.registerArticles(unique);
             unique.forEach(eventClusteringService::clusterNews);
         }
         return FetchResult.of(unique, alerts);
@@ -145,33 +162,33 @@ public class NewsService {
 
     private void enrichEventFeatures(List<NewsItem> items, List<SystemAlert> alerts) {
         if (items.isEmpty()) return;
+        EventEntityResolver resolver = new EventEntityResolver();
+        // Local evidence extraction is independent of model/vector availability.
+        items.forEach(resolver::enrich);
         if (mlClient == null) return;
         try {
             List<String> texts = items.stream().map(item -> item.getTitle() + "\n" + item.summaryPreviewText()).toList();
             List<List<Float>> vectors = mlClient.embed(texts);
-            for (int i = 0; i < items.size() && i < vectors.size(); i++) {
-                items.get(i).setEmbedding(vectors.get(i));
-                NewsItem item = items.get(i);
-                String text = item.getTitle() + "\n" + item.summaryPreviewText();
-                try {
-                    List<Map<String, Object>> entities = mlClient.ner(text);
-                    item.setEntities(entities.stream().map(value -> String.valueOf(value.getOrDefault("text", value.getOrDefault("word", ""))))
-                            .filter(value -> !value.isBlank()).distinct().toList());
-                    item.setEntityMentions(entities.stream()
-                            .map(value -> new com.bot.model.EntityMention(
-                                    String.valueOf(value.getOrDefault("text", value.getOrDefault("word", ""))),
-                                    String.valueOf(value.getOrDefault("type", "UNKNOWN"))))
-                            .filter(value -> !value.name().isBlank()).distinct().toList());
-                } catch (Exception ignored) {
-                    item.setEntities(List.of());
-                    item.setEntityMentions(List.of());
-                }
-                item.setKeywords(extractKeywords(text));
-                if (item.getTags() == null) item.setTags(List.of());
-            }
+            if (vectors != null) for (int i = 0; i < items.size() && i < vectors.size(); i++) items.get(i).setEmbedding(vectors.get(i));
+            if (vectors == null || vectors.size() < items.size() || vectors.stream().anyMatch(v -> v == null || v.isEmpty()))
+                alerts.add(SystemAlert.warn("ml-server", "EMBEDDING_UNAVAILABLE", "事件向量不可用，使用主体与事件特征保守匹配"));
         } catch (Exception exception) {
-            log.warn("event feature embedding unavailable: {}", exception.getMessage());
+            log.warn("event embedding unavailable: {}", exception.getMessage());
             alerts.add(SystemAlert.warn("ml-server", "EMBEDDING_UNAVAILABLE", "事件向量特征降级"));
+        }
+        for (NewsItem item : items) {
+            try {
+                List<Map<String, Object>> response = mlClient.ner(EventEntityResolver.text(item));
+                List<com.bot.model.EntityMention> mentions = new ArrayList<>(item.getEntityMentions());
+                if (response != null) for (Map<String, Object> value : response) {
+                    Object raw = value.get("name");
+                    if (raw == null) raw = value.getOrDefault("text", value.get("word"));
+                    if (raw != null) mentions.add(new com.bot.model.EntityMention(String.valueOf(raw),
+                            String.valueOf(value.getOrDefault("type", "UNKNOWN"))));
+                }
+                item.setEntityMentions(mentions);
+            } catch (Exception exception) { log.debug("NER unavailable for {}", item.getId()); }
+            resolver.enrich(item);
         }
     }
 
@@ -184,7 +201,6 @@ public class NewsService {
     private List<NewsItem> dispatchFeed(AppConfig.BotConfig.NewsConfig.FeedConfig feed, List<SystemAlert> alerts) {
         String type = defaultText(feed.getType(), "rss");
         String name = feed.getName();
-        if (dataSourceStatusService != null) dataSourceStatusService.started(name);
         String url = feed.getUrl();
         String category = defaultText(feed.getCategory(), CATEGORY_GENERAL);
         String trust = defaultText(feed.getTrust(), TRUST_AGGREGATED);
@@ -193,10 +209,8 @@ public class NewsService {
 
         try {
             List<NewsItem> result = fetchWithRetry(type, feed, alerts);
-        if (dataSourceStatusService != null) dataSourceStatusService.succeeded(name);
         return result;
         } catch (Exception exception) {
-            if (dataSourceStatusService != null) dataSourceStatusService.failed(name, exception.getMessage());
             throw exception;
         }
     }
@@ -282,6 +296,7 @@ public class NewsService {
     }
 
     private CompletableFuture<FeedBatch> startFeedFetch(FeedTask task) {
+        if (dataSourceStatusService != null) dataSourceStatusService.started(task.source());
         return CompletableFuture.supplyAsync(() -> {
                     List<SystemAlert> alerts = new ArrayList<>();
                     List<NewsItem> items = task.fetcher().apply(alerts);
@@ -402,7 +417,8 @@ public class NewsService {
             Document document = factory.newDocumentBuilder().parse(new ByteArrayInputStream(xmlBytes));
             NodeList entries = document.getElementsByTagName("item");
             List<NewsItem> items = new ArrayList<>();
-            for (int i = 0; i < Math.min(entries.getLength(), 5); i++) {
+            // Inspect more candidates before filtering; first five may all be off-topic.
+            for (int i = 0; i < Math.min(entries.getLength(), 30); i++) {
                 Element entry = (Element) entries.item(i);
                 String title = readTagText(entry, "title");
                 String link = readTagText(entry, "link");
@@ -418,7 +434,7 @@ public class NewsService {
                 String detailExcerpt = buildFeedDetailContent(source, description);
 
                 items.add(NewsItem.builder()
-                        .id(source.toLowerCase().replaceAll("[^a-z0-9]+", "-") + "-" + title.hashCode())
+                        .id("news-" + UUID.nameUUIDFromBytes((source + "\n" + (hasText(link) ? link : title)).getBytes(java.nio.charset.StandardCharsets.UTF_8)))
                         .title(title)
                         .summary(limit(buildFeedSummary(source, description), SUMMARY_PREVIEW_LIMIT))
                         .detailExcerpt(detailExcerpt)
@@ -586,24 +602,14 @@ public class NewsService {
         return e.getClass().getSimpleName() + ": " + message.replaceAll("\\s+", " ").trim();
     }
 
-    /** Deduplicate by title similarity (simple substring check). */
+    /** Remove duplicate deliveries only; separate sources belong in the evidence set. */
     private List<NewsItem> deduplicate(List<NewsItem> items) {
         List<NewsItem> result = new ArrayList<>();
         Set<String> seen = new HashSet<>();
         for (NewsItem item : items) {
-            String key = item.getTitle().toLowerCase().replaceAll("\\s+", "");
-            boolean dup = false;
-            for (String s : seen) {
-                if (s.contains(key.substring(0, Math.min(key.length(), 6)))
-                        || key.contains(s.substring(0, Math.min(s.length(), 6)))) {
-                    dup = true;
-                    break;
-                }
-            }
-            if (!dup) {
-                seen.add(key);
-                result.add(item);
-            }
+            String key = String.valueOf(item.getSource()) + "\n" +
+                    (hasText(item.getUrl()) ? item.getUrl() : item.getTitle().toLowerCase(Locale.ROOT).replaceAll("\\s+", ""));
+            if (seen.add(key)) result.add(item);
         }
         result.sort(Comparator.comparing(this::resolveSortInstant).reversed());
         return result.size() > OVERVIEW_RESULT_LIMIT ? new ArrayList<>(result.subList(0, OVERVIEW_RESULT_LIMIT)) : result;

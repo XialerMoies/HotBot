@@ -1,6 +1,6 @@
 <script setup>
 import { computed } from "vue";
-import { dateTime, statusLabel } from "../../lib/display.js";
+import { dateTime, statusLabel, subjectTypeLabel } from "../../lib/display.js";
 import SourceLink from "../shared/SourceLink.vue";
 import Button from "../ui/Button.vue";
 const props = defineProps({ event: Object, articles: Array });
@@ -9,6 +9,8 @@ const subjects = computed(() => props.event?.subjects?.length
   ? props.event.subjects
   : (props.event?.entities || []).slice(0, 1).map((name) => ({ name, type: "UNKNOWN", role: "PRIMARY", confidence: 0 })));
 const primarySubject = computed(() => subjects.value[0] || { name: "主体待确认", type: "UNKNOWN", role: "PRIMARY", confidence: 0 });
+const sourceCount = computed(() => new Set((props.articles || []).map(a => a.source).filter(Boolean)).size);
+const sourceFor = (id) => (props.articles || []).find(a => a.id === id)?.source || '来源待确认';
 </script>
 <template>
   <section class="panel event-detail" aria-label="事件详情" tabindex="-1">
@@ -21,7 +23,7 @@ const primarySubject = computed(() => subjects.value[0] || { name: "主体待确
     <div class="event-subject-hero">
       <span class="eyebrow">EVENT SUBJECT / 主体</span>
       <strong>{{ primarySubject.name }}</strong>
-      <span>{{ primarySubject.type }} · {{ primarySubject.role === "PRIMARY" ? "主要主体" : "关联主体" }}</span>
+      <span>{{ subjectTypeLabel(primarySubject.type) }} · {{ primarySubject.role === "PRIMARY" ? "主要主体" : "关联主体" }}</span>
     </div>
     <h2>{{ event.name }}</h2>
     <dl class="event-metadata">
@@ -35,11 +37,11 @@ const primarySubject = computed(() => subjects.value[0] || { name: "主体待确
       </div>
       <div>
         <dt>关联文章</dt>
-        <dd>{{ event.articleIds?.length || 0 }} 篇</dd>
+        <dd>{{ event.articleIds?.length || 0 }} 篇 · {{ sourceCount }} 个来源</dd>
       </div>
       <div>
-        <dt>主体置信度</dt>
-        <dd>{{ primarySubject.confidence ? Math.round(primarySubject.confidence * 100) + "%" : "待确认" }}</dd>
+        <dt>主体识别</dt>
+        <dd>{{ primarySubject.type === 'UNKNOWN' ? '待确认' : '原文实体匹配' }}</dd>
       </div>
     </dl>
     <Button @click="$emit('ask')">围绕此事件提问</Button>
@@ -47,7 +49,7 @@ const primarySubject = computed(() => subjects.value[0] || { name: "主体待确
       <h3>事件主体</h3>
       <div class="subject-list">
         <span v-for="subject in subjects" :key="subject.name" class="subject-chip">
-          <b>{{ subject.name }}</b><small>{{ subject.type }} · {{ subject.role === "PRIMARY" ? "主要主体" : "关联主体" }}</small>
+          <b>{{ subject.name }}</b><small>{{ subjectTypeLabel(subject.type) }} · {{ subject.role === "PRIMARY" ? "主要主体" : "关联主体" }}</small>
         </span>
         <span v-if="!subjects.length" class="muted">主体待确认，需要更多结构化报道。</span>
       </div>
@@ -67,7 +69,7 @@ const primarySubject = computed(() => subjects.value[0] || { name: "主体待确
         <li v-for="node in event.timeline" :key="node.articleId">
           <small
             >{{ dateTime(node.occurredAt) }} ·
-            {{ statusLabel(node.stage) }}</small
+            {{ statusLabel(node.stage) }} · {{ sourceFor(node.articleId) }}</small
           >
           <p>{{ node.summary }}</p>
         </li>

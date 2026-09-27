@@ -147,9 +147,11 @@ public class AppConfig {
         public static class NewsConfig {
             private List<FeedConfig> rssFeeds;
             private String cardOutputDir;
+            private boolean techOnly = true;
 
             @Data
             public static class FeedConfig {
+                private boolean enabled = true;
                 private String name;
                 private String url;
                 private String type;      // rss | hn | zhihu

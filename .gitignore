@@ -24,6 +24,8 @@ logs/
 frontend/node_modules/
 frontend/dist/
 bot-server/storage/events.json
+bot-server/storage/quarantine/
+bot-server/storage/events-*.tmp
 
 # Private workspace accounts and local agent settings
 bot-server/storage/workspaces.json

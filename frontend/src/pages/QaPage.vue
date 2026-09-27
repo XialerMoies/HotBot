@@ -1,5 +1,5 @@
 <script setup>
-import { computed, inject, onBeforeUnmount, ref, watch } from "vue";
+import { computed, inject, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import Button from "../components/ui/Button.vue";
 import PageHeader from "../components/shared/PageHeader.vue";
@@ -23,6 +23,16 @@ const question = ref("");
 const answer = ref(null);
 const error = ref("");
 const asking = ref(false);
+const selectedEvidence = ref('');
+const serviceStatus = ref(null);
+onMounted(async () => { try { serviceStatus.value = await api.evidenceStatus(); } catch { serviceStatus.value = {reachable:false}; } });
+function focusEvidence(id) {
+  selectedEvidence.value=id;
+  const element=document.getElementById('evidence-'+id);
+  element?.scrollIntoView?.({behavior:'smooth',block:'center'});
+  element?.focus?.({preventScroll:true});
+}
+const evidenceKind = (kind) => ({BODY:'正文片段',SUMMARY:'来源摘要',EXCERPT:'来源摘录'})[kind] || '来源片段';
 let generation = 0;
 let controller;
 function reset() {
@@ -30,6 +40,7 @@ function reset() {
   controller?.abort();
   asking.value = false;
   answer.value = null;
+  selectedEvidence.value = '';
   error.value = "";
 }
 watch(eventId, reset);
@@ -71,6 +82,7 @@ async function ask() {
     />
     <section v-if="!workspace.data.value" class="signin-state panel"><h2>登录后基于证据提问</h2><p class="muted">选择事件、核对来源并查看回答。</p><Button @click="openAuth()">登录 / 注册</Button></section>
     <template v-else>
+    <p v-if="serviceStatus" class="muted" role="status">{{ serviceStatus.reachable ? '模型服务可连接 · 生成结果以本次请求为准' : '模型服务暂不可连接 · 可使用已缓存证据降级展示' }}</p>
     <Panel title="提问范围">
       <label class="field"
         >选择事件<select v-model="eventId">
@@ -130,9 +142,10 @@ async function ask() {
     <div v-if="answer" class="answer-layout">
       <Panel title="回答"
         ><span v-if="answer.fallback" class="pill">检索降级回答</span>
-        <p class="answer-text">{{ answer.answer }}</p>
+        <div v-if="answer.claims?.length" class="answer-claims"><p v-for="(claim, index) in answer.claims" :key="index">{{ claim.text }} <Button v-for="id in claim.evidenceIds" :key="id" size="sm" variant="outline" :data-evidence-id="id" @click="focusEvidence(id)">证据 {{ (answer.evidence || []).findIndex(e=>e.id===id)+1 }}</Button></p></div>
+        <p v-else class="answer-text">{{ answer.answer }}</p>
         <p v-if="answer.fallback" class="muted">
-          当前结果来自检索原文；证据不足时应继续核对来源。
+          当前为检索片段展示，未形成完整分析结论。摘要与正文请按标记区分。
         </p></Panel
       >
       <Panel :title="'原文证据 · ' + (answer.evidence?.length || 0)">
@@ -140,8 +153,11 @@ async function ask() {
           v-for="(item, index) in answer.evidence"
           :key="item.id"
           class="evidence-item"
+          :class="{'evidence-selected': selectedEvidence === item.id}"
+          :id="'evidence-'+item.id"
+          tabindex="-1"
         >
-          <small>证据 {{ index + 1 }} · {{ item.id }}</small>
+          <small>证据 {{ index + 1 }} · {{ evidenceKind(item.kind) }} · {{ item.source || '来源未标注' }}<template v-if="item.startOffset != null"> · 字符 {{ item.startOffset }}–{{ item.endOffset }}</template></small>
           <h3>{{ item.title || "来源报道" }}</h3>
           <blockquote>{{ item.quote || item.text }}</blockquote>
           <SourceLink :url="item.url" /><small
@@ -164,3 +180,6 @@ async function ask() {
     </template>
   </section>
 </template>
+<style scoped>
+.answer-claims p{line-height:1.9;overflow-wrap:anywhere}.answer-claims .ui-button{margin:3px;font-size:12px}.evidence-selected{outline:2px solid #d74b1a;background:#fff4ed;outline-offset:4px}.evidence-item{scroll-margin-top:30px}.evidence-item blockquote{white-space:pre-wrap;overflow-wrap:anywhere}
+</style>

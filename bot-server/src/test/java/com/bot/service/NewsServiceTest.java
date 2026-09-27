@@ -26,12 +26,82 @@ import static org.mockito.Mockito.when;
 
 class NewsServiceTest {
 
+    @Test
+    void preservesSameTitleFromDifferentSourcesAndReadsNerNameDespiteEmptyVectors() throws Exception {
+        var rest = mock(RestTemplate.class);
+        var ml = mock(com.bot.client.PythonMLClient.class);
+        var config = testBotConfig();
+        config.getNews().setTechOnly(true);
+        var a = feed("甲科技", "https://a.real.org/feed", "rss", "tech", "official_rss", null);
+        var b = feed("乙科技", "https://b.real.org/feed", "rss", "tech", "official_rss", null);
+        config.getNews().setRssFeeds(List.of(a,b));
+        when(rest.getForObject(a.getUrl(), byte[].class)).thenReturn(rssBytes("星河计算发布 Nova 2 芯片", "https://a.real.org/report", sortTimestampToday(8)));
+        when(rest.getForObject(b.getUrl(), byte[].class)).thenReturn(rssBytes("星河计算发布 Nova 2 芯片", "https://b.real.org/report", sortTimestampToday(9)));
+        when(ml.embed(any())).thenReturn(List.of());
+        when(ml.ner(any())).thenReturn(List.of(Map.of("name","星河计算","type","COMPANY"),Map.of("name","Nova 2","type","PRODUCT")));
+        var service = new NewsService(rest, Runnable::run, config, ml);
+        var articles = service.fetchAll();
+        assertEquals(2, articles.size());
+        assertEquals(2, articles.stream().map(NewsItem::getId).distinct().count());
+        assertTrue(articles.stream().allMatch(item -> item.getEntityMentions().contains(new com.bot.model.EntityMention("星河计算", "COMPANY"))));
+        org.mockito.Mockito.verify(ml, org.mockito.Mockito.times(2)).ner(any());
+    }
+
+    @Test
+    void malformedSourceIsFailedWhileSuccessfullyFilteredSourceRemainsSuccessful() {
+        var rest = mock(RestTemplate.class);
+        var config = testBotConfig();
+        config.getNews().setTechOnly(true);
+        var malformed = feed("Malformed", "https://bad.real.org/feed", "rss", "tech", "official_rss", null);
+        var promotion = feed("Science", "https://science.real.org/feed", "rss", "tech", "aggregated", null);
+        config.getNews().setRssFeeds(List.of(malformed, promotion));
+        when(rest.getForObject(malformed.getUrl(), byte[].class)).thenReturn("<html>not RSS".getBytes(StandardCharsets.UTF_8));
+        when(rest.getForObject(promotion.getUrl(), byte[].class)).thenReturn(rssBytes("期刊征订开启", "https://science.real.org/1", sortTimestampToday(8)));
+        var status = new DataSourceStatusService();
+        var result = new NewsService(rest, Runnable::run, config, null, null, status).fetchAll();
+        assertTrue(result.isEmpty());
+        assertEquals("FAILED", status.list().stream().filter(s -> s.name().equals("Malformed")).findFirst().orElseThrow().state());
+        assertEquals("SUCCESS", status.list().stream().filter(s -> s.name().equals("Science")).findFirst().orElseThrow().state());
+    }
+
+    @Test
+    void technologyScopeSkipsGeneralSourcesAndFiltersBeforeEmbeddingAndClustering() throws Exception {
+        var rest = mock(RestTemplate.class);
+        var ml = mock(com.bot.client.PythonMLClient.class);
+        var config = testBotConfig();
+        config.getNews().setTechOnly(true);
+        var general = feed("general", "https://general.real.org/feed", "rss", "general", "aggregated", null);
+        var disabled = feed("disabled", "https://disabled.real.org/feed", "rss", "tech", "aggregated", null);
+        disabled.setEnabled(false);
+        var tech = feed("Tech", "https://tech.real.org/feed", "rss", "tech", "official_rss", null);
+        config.getNews().setRssFeeds(List.of(general, disabled, tech));
+        String entries = "";
+        // A qualifying report after five rejected entries must still be considered.
+        for (String title : List.of("征订开启", "男子买房", "台风登陆", "比赛结果公布", "AI课程限时优惠", "芯片性能测试发布")) {
+            entries += "<item><title>" + title + "</title><link>https://tech.real.org/report</link></item>";
+        }
+        when(rest.getForObject(tech.getUrl(), byte[].class))
+                .thenReturn(("<rss><channel>" + entries + "</channel></rss>").getBytes(StandardCharsets.UTF_8));
+        when(ml.embed(any())).thenReturn(List.of());
+        var clustering = new EventClusteringService(java.nio.file.Files.createTempDirectory("scope-feed").resolve("events.json"), true);
+        var service = new NewsService(rest, Runnable::run, config, ml, clustering);
+        var result = service.fetchAll();
+        assertEquals(List.of("芯片性能测试发布"), result.stream().map(NewsItem::getTitle).toList());
+        assertEquals(1, clustering.list().size());
+        org.mockito.Mockito.verify(rest, org.mockito.Mockito.never()).getForObject(general.getUrl(), byte[].class);
+        org.mockito.Mockito.verify(rest, org.mockito.Mockito.never()).getForObject(disabled.getUrl(), byte[].class);
+        org.mockito.Mockito.verify(ml).embed(List.of("芯片性能测试发布\n"));
+        service.fetchAll();
+        org.mockito.Mockito.verify(rest, org.mockito.Mockito.times(1)).getForObject(tech.getUrl(), byte[].class);
+    }
+
     private NewsService newService(RestTemplate restTemplate) {
         return new NewsService(restTemplate, Runnable::run, testBotConfig());
     }
 
     private AppConfig.BotConfig testBotConfig() {
         AppConfig.BotConfig.NewsConfig news = new AppConfig.BotConfig.NewsConfig();
+        news.setTechOnly(false); // Legacy feed parser coverage intentionally includes general feeds.
                 news.setRssFeeds(new ArrayList<>(List.of(
                                 feed("TechCrunch RSS", "https://techcrunch.com/feed/", "rss", "tech", "official_rss", null),
                                 feed("新华社新闻_新华网", "https://plink.anyfeeder.com/newscn/whxw", "rss", "general", "aggregated", null),

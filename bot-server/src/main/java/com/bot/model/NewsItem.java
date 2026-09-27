@@ -20,6 +20,8 @@ public class NewsItem {
     private String translatedSummaryPreview;
     private String detailExcerpt;
     private String fullBody;
+    private String contentStatus;
+    private String contentFetchedAt;
     private String translatedDetailExcerpt;
     private String translatedFullBody;
     private String url;

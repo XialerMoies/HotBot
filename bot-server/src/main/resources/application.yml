@@ -41,8 +41,10 @@ bot:
 
   # News sources RSS
   news:
+    tech-only: true
     rss-feeds:
       - name: "新华社新闻_新华网"
+        enabled: false
         url: "https://plink.anyfeeder.com/newscn/whxw"
         type: "rss"
         category: "general"
@@ -58,11 +60,13 @@ bot:
         category: "tech"
         trust: "aggregated"
       - name: "环球时报"
+        enabled: false
         url: "https://plink.anyfeeder.com/weixin/hqsbwx"
         type: "rss"
         category: "general"
         trust: "aggregated"
       - name: "中国国家地理"
+        enabled: false
         url: "https://plink.anyfeeder.com/weixin/dili360"
         type: "rss"
         category: "general"
@@ -74,6 +78,7 @@ bot:
         trust: "aggregated"
         fallback: "https://news.ycombinator.com/rss"
       - name: "知乎日报"
+        enabled: false
         url: "https://news-at.zhihu.com/api/4/news/latest"
         type: "zhihu"
         category: "general"

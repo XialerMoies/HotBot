@@ -7,7 +7,7 @@ import Button from '../ui/Button.vue';
 import SourceLink from '../shared/SourceLink.vue';
 import RequestState from '../shared/RequestState.vue';
 import { api } from '../../services/api.js';
-import { dateTime, statusLabel } from '../../lib/display.js';
+import { dateTime, statusLabel, subjectTypeLabel } from '../../lib/display.js';
 const props = defineProps({event:{type:Object,required:true}});
 const {workspace,openAuth} = inject('app');
 const router = useRouter();
@@ -15,7 +15,6 @@ const expanded = ref(true), evidenceOpen = ref(false), loading = ref(false), bus
 let generation = 0;
 const subjects = computed(() => props.event.subjects?.length ? props.event.subjects : (props.event.entities || []).map(name=>({name,type:'keyword'})));
 const primary = computed(() => subjects.value.find(s=>s.role==='PRIMARY') || subjects.value[0]);
-const types = {COMPANY:'公司',PERSON:'人物',PRODUCT:'产品',TECHNOLOGY:'技术',ORGANIZATION:'机构',UNKNOWN:'主体',keyword:'主体'};
 const timeline = computed(() => [...(props.event.timeline || [])].sort((a,b)=>(Date.parse(a.occurredAt)||0)-(Date.parse(b.occurredAt)||0)));
 const visibleArticles = computed(() => selectedArticle.value ? articles.value.filter(a=>a.id===selectedArticle.value) : articles.value);
 const followed = computed(() => workspace.data.value?.follows?.some(f=>f.value.toLowerCase()===primary.value?.name.toLowerCase()));
@@ -24,7 +23,7 @@ async function showEvidence(articleId = null){
   if(!requireLogin())return;
   selectedArticle.value=articleId; evidenceOpen.value=true; error.value='';loading.value=true;
   const request=++generation, owner=workspace.data.value.id;
-  try{const result=await api.eventDetail(props.event.id);if(request===generation && workspace.data.value?.id===owner)articles.value=result.articles || [];}
+  try{const result={articles:await api.evidenceSources(props.event.id)};if(request===generation && workspace.data.value?.id===owner)articles.value=result.articles || [];}
   catch(e){if(request===generation)error.value=api.message(e);}
   finally{if(request===generation)loading.value=false;}
 }
@@ -42,13 +41,13 @@ watch(()=>props.event.lastUpdatedAt,()=>{generation++;articles.value=[];evidence
 </script>
 <template>
 <CollapsibleRoot v-model:open="expanded" class="home-event">
-  <CollapsibleTrigger class="he-head"><span class="he-subject"><span class="he-monogram">{{ primary?.name?.slice(0,1) || '—' }}</span><span><strong>{{ primary?.name || '主体待确认' }}</strong><small>{{ types[primary?.type] || '主体' }}<template v-if="subjects.length>1"> · {{ subjects.slice(1,3).map(s=>s.name).join(' / ') }}</template></small></span></span><span class="he-state" :class="{ongoing:event.status==='ONGOING'}">{{ statusLabel(event.status) }}</span><span class="he-toggle">{{ expanded?'收起':'展开' }}<ChevronUp v-if="expanded" :size="14"/><ChevronDown v-else :size="14"/></span><span class="he-title">{{ event.name }}</span></CollapsibleTrigger>
+  <CollapsibleTrigger class="he-head"><span class="he-subject"><span class="he-monogram">{{ primary?.name?.slice(0,1) || '—' }}</span><span><strong>{{ primary?.name || '主体待确认' }}</strong><small>{{ subjectTypeLabel(primary?.type) }}<template v-if="subjects.length>1"> · {{ subjects.slice(1,3).map(s=>s.name).join(' / ') }}</template></small></span></span><span class="he-state" :class="{ongoing:event.status==='ONGOING'}">{{ statusLabel(event.status) }}</span><span class="he-toggle">{{ expanded?'收起':'展开' }}<ChevronUp v-if="expanded" :size="14"/><ChevronDown v-else :size="14"/></span><span class="he-title">{{ event.name }}</span></CollapsibleTrigger>
   <CollapsibleContent><div class="he-meta"><span>{{ dateTime(event.firstSeenAt) }} 首次出现</span><span>{{ dateTime(event.lastUpdatedAt) }} 更新</span><span>{{ event.articleIds?.length || 0 }} 篇报道</span></div>
     <div class="he-update"><b>最新进展</b><p>{{ timeline.at(-1)?.summary || '暂无已整理的进展。' }}</p></div>
     <div class="he-body"><h3>事件进展 <small>{{ timeline.length }} 个节点</small></h3><div class="he-timeline"><button v-for="(node,index) in timeline.slice(-3)" :key="node.articleId" class="he-step" :class="{latest:index===timeline.slice(-3).length-1}" @click="showEvidence(node.articleId)"><time>{{ dateTime(node.occurredAt) }}</time><strong>{{ node.summary }}</strong><span>{{ statusLabel(node.stage) }} <ArrowUpRight :size="13"/></span></button><p v-if="!timeline.length" class="he-empty">时间线尚未建立</p></div>
       <Button v-if="timeline.length>3" variant="ghost" @click="router.push({name:'workspace',query:{tab:'events',event:event.id}})">查看完整时间线（{{ timeline.length }}）<ArrowUpRight :size="14"/></Button>
       <RequestState :error="error" @retry="evidenceOpen?showEvidence(selectedArticle):follow()"/>
-      <section v-if="evidenceOpen && workspace.data.value" class="he-evidence" aria-label="来源证据"><div class="he-evidence-title"><h3>来源证据</h3><Button variant="ghost" size="sm" @click="evidenceOpen=false">收起证据</Button></div><RequestState :loading="loading"/><template v-if="!loading && !error"><article v-for="article in visibleArticles" :key="article.id"><small>{{ article.source || '来源未标注' }} · {{ dateTime(article.publishTime) }}</small><h4>{{ article.title }}</h4><blockquote v-if="article.content">{{ article.content.slice(0,600) }}{{ article.content.length>600?'…':'' }}</blockquote><p v-else>暂无原文片段，请打开来源核对。</p><SourceLink :url="article.url" title="打开原文" /></article><p v-if="!visibleArticles.length">暂无可读取的来源证据。</p></template></section>
+      <section v-if="evidenceOpen && workspace.data.value" class="he-evidence" aria-label="来源证据"><div class="he-evidence-title"><h3>来源证据</h3><Button variant="ghost" size="sm" @click="evidenceOpen=false">收起证据</Button></div><RequestState :loading="loading"/><template v-if="!loading && !error"><article v-for="article in visibleArticles" :key="article.id"><small>{{ article.source || '来源未标注' }} · {{ article.fullBody ? '正文' : '仅摘要/摘录' }} · {{ dateTime(article.publishTime) }}</small><h4>{{ article.title }}</h4><blockquote v-if="(article.fullBody || article.detailExcerpt || article.summary)">{{ (article.fullBody || article.detailExcerpt || article.summary).slice(0,600) }}{{ (article.fullBody || article.detailExcerpt || article.summary).length>600?'…':'' }}</blockquote><p v-else>暂无原文片段，请打开来源核对。</p><SourceLink :url="article.url" title="打开原文" /></article><p v-if="!visibleArticles.length">暂无可读取的来源证据。</p></template></section>
     </div>
     <div class="he-actions"><Button @click="showEvidence()">查看依据</Button><Button variant="outline" :disabled="busy || !primary || !!followed" @click="follow"><Check v-if="followed" :size="14"/><Plus v-else :size="14"/>{{ followed?'已关注':'关注主体' }}</Button><Button variant="outline" @click="ask"><MessageSquare :size="14"/>基于证据提问</Button></div>
   </CollapsibleContent>
