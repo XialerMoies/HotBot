@@ -27,7 +27,7 @@ import java.util.stream.Collectors;
 
 @Slf4j
 @Component
-@RequiredArgsConstructor
+@RequiredArgsConstructor(onConstructor_ = @org.springframework.beans.factory.annotation.Autowired)
 public class DailyBotScheduler {
 
     private final WeatherService weatherService;
@@ -40,6 +40,15 @@ public class DailyBotScheduler {
     private final TemplateRenderer renderer;
     private final WeChatPusher pusher;
     private final PythonMLClient mlClient;
+    private final EventClusteringService eventClusteringService;
+
+    public DailyBotScheduler(WeatherService weatherService, NewsService newsService, WordService wordService,
+                             JokeService jokeService, TrackingService trackingService, CommentSourceService commentSourceService,
+                             HistoryTodayService historyTodayService, TemplateRenderer renderer, WeChatPusher pusher,
+                             PythonMLClient mlClient) {
+        this(weatherService, newsService, wordService, jokeService, trackingService, commentSourceService,
+                historyTodayService, renderer, pusher, mlClient, new EventClusteringService());
+    }
 
     /** Last push signature — used for dedup. */
     private volatile String lastPushSignature;
@@ -71,6 +80,7 @@ public class DailyBotScheduler {
             JokeItem joke = jokeFuture.join();
             WeatherInfo weather = weatherResult.data();
             List<NewsItem> news = newsResult.data();
+            clusterNews(news);
             DailyWord word = wordResult.data();
             List<SystemAlert> alerts = Collections.synchronizedList(new ArrayList<>());
             alerts.addAll(weatherResult.alerts());
@@ -173,6 +183,16 @@ public class DailyBotScheduler {
 
         } catch (Exception e) {
             log.error("Daily bot push failed", e);
+        }
+    }
+
+    private void clusterNews(List<NewsItem> news) {
+        for (NewsItem item : news) {
+            try {
+                eventClusteringService.clusterNews(item);
+            } catch (RuntimeException exception) {
+                log.warn("event clustering failed for {}: {}", item.getId(), exception.getMessage());
+            }
         }
     }
 

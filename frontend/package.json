@@ -1,0 +1,26 @@
+{
+  "name": "hotbot-intelligence-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@vitejs/plugin-vue": "latest",
+    "axios": "latest",
+    "lucide-vue-next": "^0.468.0",
+    "reka-ui": "^2.10.5",
+    "shadcn-vue": "^2.8.2",
+    "tailwindcss": "latest",
+    "vite": "latest",
+    "vue": "latest",
+    "vue-router": "^4.6.4"
+  },
+  "devDependencies": {
+    "@vue/test-utils": "^2.5.1",
+    "jsdom": "^30.1.1",
+    "vitest": "^5.0.2"
+  }
+}

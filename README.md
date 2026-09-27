@@ -596,7 +596,33 @@ Intent 分类使用预计算原型向量缓存（`prototype_vectors.json`），C
 
 ## 相关说明
 
+### 第一阶段事件情报 Web
+
+前端位于 `frontend/`，使用 Vue 3、Vite、Axios、Lucide 和 shadcn-vue 生成的本地 Button 组件。启动方式：
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+开发服务器默认将 `/api` 代理到 `http://localhost:8180`；可通过启动 Vite 时的 `BOT_SERVER_PORT` 环境变量覆盖，请与后端端口保持一致。第一阶段 API 包括 `GET /api/events`、`GET /api/events/{id}`、`POST /api/events/cluster/news` 和 `POST /api/evidence/events/{eventId}/answer`。事件状态默认持久化到 `bot-server/storage/events.json`，可通过 `-Dhotbot.event.state=...` 指定路径。
+
+### 第二阶段个人工作区
+
+第二阶段已接入注册登录、关注项、订阅、每日摘要、通知和数据源状态：
+
+```text
+POST /api/workspace/register       POST /api/workspace/login
+GET  /api/workspace                POST /api/workspace/follows
+POST /api/workspace/subscriptions POST /api/workspace/digests/generate
+POST /api/workspace/notifications/{id}/read
+GET  /api/operations/sources
+```
+
+上述个人工作区接口（除注册和登录）使用 `X-Workspace-Token` 请求头。工作区默认保存到 `bot-server/storage/workspaces.json`。新闻源支持主地址、备用地址和一次重试，状态接口会记录运行状态、尝试次数和最后错误。前端工作区已集成到 `frontend/src/App.vue`。
+
 - 微信网关细节见 [ml-server/weixin_gateway/README.md](ml-server/weixin_gateway/README.md)
 - 环境变量示例见 [.env.example](.env.example)
-- 项目路线图见 [ROADMAP.md](ROADMAP.md)
-- 对标分析： [astrbot_plugin_dailyhub-master/](astrbot_plugin_dailyhub-master/)（每日资讯插件）
+- 前端验收记录见 [docs/frontend-polish-acceptance.md](docs/frontend-polish-acceptance.md)
+- 毕设规划见 [毕设规划文档-情报事件聚类与证据问答系统.md](毕设规划文档-情报事件聚类与证据问答系统.md)

@@ -82,4 +82,10 @@ public class NewsItem {
 
     // Long-term topic tracking
     private String topicLine;    // e.g. "「GPT系列」GPT-4(2023) → GPT-5(2026)"
+
+    // Event intelligence features. Kept optional for compatibility with existing feeds.
+    private List<String> entities;
+    private List<EntityMention> entityMentions;
+    private List<String> keywords;
+    private List<Float> embedding;
 }

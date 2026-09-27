@@ -8,6 +8,7 @@ import com.bot.util.NewsTimeUtils;
 import static com.bot.util.TextUtils.hasText;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.client.RestTemplate;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
@@ -27,6 +28,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import com.bot.client.PythonMLClient;
 
 import static com.bot.util.TextUtils.defaultText;
 
@@ -52,11 +54,35 @@ public class NewsService {
     private final RestTemplate restTemplate;
     private final Executor taskExecutor;
     private final AppConfig.BotConfig botConfig;
+    private final PythonMLClient mlClient;
+    private final EventClusteringService eventClusteringService;
+    private final DataSourceStatusService dataSourceStatusService;
 
-    public NewsService(RestTemplate restTemplate, Executor taskExecutor, AppConfig.BotConfig botConfig) {
+    public NewsService(RestTemplate restTemplate, Executor taskExecutor, AppConfig.BotConfig botConfig,
+                       PythonMLClient mlClient) {
+        this(restTemplate, taskExecutor, botConfig, mlClient, null);
+    }
+
+    public NewsService(RestTemplate restTemplate, Executor taskExecutor, AppConfig.BotConfig botConfig,
+                       PythonMLClient mlClient, EventClusteringService eventClusteringService) {
+        this(restTemplate, taskExecutor, botConfig, mlClient, eventClusteringService, null);
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public NewsService(RestTemplate restTemplate, Executor taskExecutor, AppConfig.BotConfig botConfig,
+                       PythonMLClient mlClient, EventClusteringService eventClusteringService,
+                       DataSourceStatusService dataSourceStatusService) {
         this.restTemplate = restTemplate;
         this.taskExecutor = taskExecutor;
         this.botConfig = botConfig;
+        this.mlClient = mlClient;
+        this.eventClusteringService = eventClusteringService;
+        this.dataSourceStatusService = dataSourceStatusService;
+    }
+
+    /** Compatibility constructor for existing tests and lightweight callers. */
+    public NewsService(RestTemplate restTemplate, Executor taskExecutor, AppConfig.BotConfig botConfig) {
+        this(restTemplate, taskExecutor, botConfig, null);
     }
 
     private volatile FetchResult<List<NewsItem>> cachedNewsResult = FetchResult.of(List.of());
@@ -108,30 +134,99 @@ public class NewsService {
             alerts.addAll(batch.alerts());
         }
 
-        return FetchResult.of(deduplicate(all), alerts);
+        List<NewsItem> unique = deduplicate(all);
+        enrichEventFeatures(unique, alerts);
+        if (eventClusteringService != null) {
+            eventClusteringService.registerArticles(unique);
+            unique.forEach(eventClusteringService::clusterNews);
+        }
+        return FetchResult.of(unique, alerts);
+    }
+
+    private void enrichEventFeatures(List<NewsItem> items, List<SystemAlert> alerts) {
+        if (items.isEmpty()) return;
+        if (mlClient == null) return;
+        try {
+            List<String> texts = items.stream().map(item -> item.getTitle() + "\n" + item.summaryPreviewText()).toList();
+            List<List<Float>> vectors = mlClient.embed(texts);
+            for (int i = 0; i < items.size() && i < vectors.size(); i++) {
+                items.get(i).setEmbedding(vectors.get(i));
+                NewsItem item = items.get(i);
+                String text = item.getTitle() + "\n" + item.summaryPreviewText();
+                try {
+                    List<Map<String, Object>> entities = mlClient.ner(text);
+                    item.setEntities(entities.stream().map(value -> String.valueOf(value.getOrDefault("text", value.getOrDefault("word", ""))))
+                            .filter(value -> !value.isBlank()).distinct().toList());
+                    item.setEntityMentions(entities.stream()
+                            .map(value -> new com.bot.model.EntityMention(
+                                    String.valueOf(value.getOrDefault("text", value.getOrDefault("word", ""))),
+                                    String.valueOf(value.getOrDefault("type", "UNKNOWN"))))
+                            .filter(value -> !value.name().isBlank()).distinct().toList());
+                } catch (Exception ignored) {
+                    item.setEntities(List.of());
+                    item.setEntityMentions(List.of());
+                }
+                item.setKeywords(extractKeywords(text));
+                if (item.getTags() == null) item.setTags(List.of());
+            }
+        } catch (Exception exception) {
+            log.warn("event feature embedding unavailable: {}", exception.getMessage());
+            alerts.add(SystemAlert.warn("ml-server", "EMBEDDING_UNAVAILABLE", "事件向量特征降级"));
+        }
+    }
+
+    private List<String> extractKeywords(String text) {
+        if (text == null) return List.of();
+        return Arrays.stream(text.replaceAll("[^\\p{L}\\p{Nd}]+", " ").toLowerCase(Locale.ROOT).split("\\s+"))
+                .filter(token -> token.length() >= 2).distinct().limit(12).toList();
     }
 
     private List<NewsItem> dispatchFeed(AppConfig.BotConfig.NewsConfig.FeedConfig feed, List<SystemAlert> alerts) {
         String type = defaultText(feed.getType(), "rss");
         String name = feed.getName();
+        if (dataSourceStatusService != null) dataSourceStatusService.started(name);
         String url = feed.getUrl();
         String category = defaultText(feed.getCategory(), CATEGORY_GENERAL);
         String trust = defaultText(feed.getTrust(), TRUST_AGGREGATED);
         String fallback = feed.getFallback();
         List<String> fallbackUrls = feed.getFallbackUrls();
 
-        return switch (type) {
-            case "rss" -> fetchRssWithFallback(url, name, category, trust, alerts,
-                    alertCode(name, "FETCH_FAILED"), alertCode(name, "RSS_PARSE_FAILED"),
-                    fallback, fallbackUrls);
-            case "hn" -> fetchHackerNewsRss(feed, alerts);
-            case "juejin" -> fetchJuejinHot(alerts, feed);
-            case "zhihu" -> fetchZhihuDaily(alerts, feed);
-            default -> {
-                log.warn("Unknown feed type '{}' for '{}', skipping", type, name);
-                yield List.of();
+        try {
+            List<NewsItem> result = fetchWithRetry(type, feed, alerts);
+        if (dataSourceStatusService != null) dataSourceStatusService.succeeded(name);
+        return result;
+        } catch (Exception exception) {
+            if (dataSourceStatusService != null) dataSourceStatusService.failed(name, exception.getMessage());
+            throw exception;
+        }
+    }
+
+    private List<NewsItem> fetchWithRetry(String type, AppConfig.BotConfig.NewsConfig.FeedConfig feed, List<SystemAlert> alerts) {
+        RuntimeException last = null;
+        for (int attempt = 1; attempt <= 2; attempt++) {
+            try {
+                String name = feed.getName();
+                String url = feed.getUrl();
+                String category = defaultText(feed.getCategory(), CATEGORY_GENERAL);
+                String trust = defaultText(feed.getTrust(), TRUST_AGGREGATED);
+                List<String> fallbackUrls = feed.getFallbackUrls();
+                List<NewsItem> result = switch (type) {
+                    case "rss" -> fetchRssWithFallback(url, name, category, trust, alerts,
+                            alertCode(name, "FETCH_FAILED"), alertCode(name, "RSS_PARSE_FAILED"),
+                            feed.getFallback(), fallbackUrls);
+                    case "hn" -> fetchHackerNewsRss(feed, alerts);
+                    case "juejin" -> fetchJuejinHot(alerts, feed);
+                    case "zhihu" -> fetchZhihuDaily(alerts, feed);
+                    default -> List.of();
+                };
+                if (!result.isEmpty() || attempt == 2) return result;
+            } catch (RuntimeException exception) {
+                last = exception;
+                if (attempt < 2) log.warn("Feed {} attempt {} failed, retrying", feed.getName(), attempt);
             }
-        };
+        }
+        if (last != null) throw last;
+        return List.of();
     }
 
     private List<NewsItem> fetchRssWithFallback(String url, String name, String category,

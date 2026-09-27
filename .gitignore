@@ -21,3 +21,10 @@ ml-server/weixin_gateway/__pycache__/
 logs/
 .pids/
 *.log
+frontend/node_modules/
+frontend/dist/
+bot-server/storage/events.json
+
+# Private workspace accounts and local agent settings
+bot-server/storage/workspaces.json
+.claude/
